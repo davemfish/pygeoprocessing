@@ -8,6 +8,7 @@ from .geoprocessing_core import DEFAULT_GTIFF_CREATION_TUPLE_OPTIONS
 from builtins import zip
 from builtins import range
 import logging
+import logging.handlers
 import os
 import functools
 import math
@@ -85,6 +86,41 @@ _GDAL_TYPE_TO_NUMPY_LOOKUP = {
     gdal.GDT_CFloat32: numpy.csingle,
     gdal.GDT_CFloat64: numpy.complex64,
 }
+
+def _initialize_logging_to_queue(logging_queue):
+    """Add a synchronized queue to a new process.
+    This is intended to be called as an initialization function to
+    ``multiprocessing.Pool`` to establish logging from a Pool worker to the
+    main python process via a multiprocessing Queue.
+    Parameters:
+        logging_queue (multiprocessing.Queue): The queue to use for passing
+            log records back to the main process.
+    Returns:
+        ``None``
+    """
+    root_logger = logging.getLogger()
+
+    # By the time this function is called, ``root_logger`` has a copy of all of
+    # the logging handlers registered to it within the parent process, which
+    # leads to duplicate logging in some cases.  By removing all of the
+    # handlers here, we ensure that log messages can only be passed back to the
+    # parent process by the ``logging_queue``, where they will be handled.
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+
+    root_logger.setLevel(logging.NOTSET)
+    handler = logging.handlers.QueueHandler(logging_queue)
+    root_logger.addHandler(handler)
+
+def _handle_logs_from_processes(queue_):
+    LOGGER.debug('Starting logging worker')
+    while True:
+        record = queue_.get()
+        if record is None:
+            break
+        logger = logging.getLogger(record.name)
+        logger.handle(record)
+    LOGGER.debug('_handle_logs_from_processes shutting down')
 
 
 def raster_calculator(
@@ -597,6 +633,7 @@ def align_and_resize_raster_stack(
         ValueError if ``pixel_size`` is not a 2 element sequence of numbers.
 
     """
+    LOGGER.info('starting align and resize')
     # make sure that the input lists are of the same length
     list_lengths = [
         len(base_raster_path_list), len(target_raster_path_list),
@@ -743,10 +780,18 @@ def align_and_resize_raster_stack(
     if n_workers > 1:
         # We could use multiple processes to take advantage of the
         # parallelization offered.
+        logging_queue = multiprocessing.Queue()
         LOGGER.info(
             "n_workers > 1 (%d) so starting a processes pool.", n_workers)
         try:
-            worker_pool = multiprocessing.Pool(n_workers)
+            worker_pool = multiprocessing.Pool(
+                n_workers, initializer=_initialize_logging_to_queue,
+                initargs=(logging_queue,))
+            logging_monitor_thread = threading.Thread(
+                target=_handle_logs_from_processes,
+                args=(logging_queue,))
+            logging_monitor_thread.daemon = True
+            logging_monitor_thread.start()
             if HAS_PSUTIL:
                 parent = psutil.Process()
                 parent.nice(PROCESS_LOW_PRIORITY)
@@ -803,6 +848,26 @@ def align_and_resize_raster_stack(
     finally:
         worker_pool.join()
         worker_pool.terminate()
+        # close down the log monitor thread
+        _max_timeout = 5.0
+        timedout = not logging_monitor_thread.join(_max_timeout)
+        if timedout:
+            LOGGER.debug(
+                '_logging_monitor_thread %s timed out',
+                logging_monitor_thread)
+
+        if logging_queue:
+            # Close down the logging monitor thread.
+            logging_queue.put(None)
+            logging_monitor_thread.join(_MAX_TIMEOUT)
+            # drain the queue if anything is left
+            while True:
+                try:
+                    x = logging_queue.get_nowait()
+                    LOGGER.debug(
+                        "the logging queue had this in it: %s", x)
+                except queue.Empty:
+                    break
 
     LOGGER.info("aligned all %d rasters.", n_rasters)
 

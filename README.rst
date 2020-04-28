@@ -1,6 +1,6 @@
 .. default-role:: code
 
-About PyGeoprocessing
+About PyGeoprocessing 
 =====================
 
 PyGeoprocessing is a Python/Cython based library that provides a set of
